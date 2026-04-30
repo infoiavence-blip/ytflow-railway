@@ -1,142 +1,161 @@
 from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
-import yt_dlp
-import os
-import tempfile
+import yt_dlp, os, tempfile, subprocess, sys, time
 
 app = Flask(__name__)
 CORS(app)
 
+# Update yt-dlp on every cold start to avoid stale format errors
+def update_ytdlp():
+    try:
+        subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', '--upgrade', 'yt-dlp'],
+                       capture_output=True, timeout=60)
+    except Exception:
+        pass
+
+update_ytdlp()
+
+YDL_BASE = {
+    'quiet': True,
+    'no_warnings': True,
+    'retries': 5,
+    'fragment_retries': 5,
+    'socket_timeout': 30,
+    # Bypass age/region restrictions
+    'extractor_args': {
+        'youtube': {
+            'player_client': ['web', 'android'],
+        }
+    },
+    'http_headers': {
+        'User-Agent': 'Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 Chrome/90.0.4430.91 Mobile Safari/537.36',
+    },
+}
+
 @app.route('/')
 def index():
-    return jsonify({ 'status': 'ok', 'service': 'ytflow-audio' })
+    return jsonify({'status': 'ok', 'service': 'ytflow-audio'})
 
-# ── Info (metadata only) ──────────────────────────────
 @app.route('/info')
 def info():
     video_id = request.args.get('id', '').strip()
     if not video_id:
-        return jsonify({ 'error': 'Missing id' }), 400
-
-    ydl_opts = {
-        'quiet': True,
-        'no_warnings': True,
-        'skip_download': True,
-        'extract_flat': False,
-    }
+        return jsonify({'error': 'Missing id'}), 400
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            data = ydl.extract_info(
-                f'https://www.youtube.com/watch?v={video_id}',
-                download=False
-            )
-        thumb = data.get('thumbnail') or f'https://i.ytimg.com/vi/{video_id}/mqdefault.jpg'
+        opts = {**YDL_BASE, 'skip_download': True}
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            data = ydl.extract_info(f'https://www.youtube.com/watch?v={video_id}', download=False)
         return jsonify({
-            'id':       video_id,
-            'title':    data.get('title', ''),
-            'channel':  data.get('uploader') or data.get('channel', ''),
+            'id': video_id,
+            'title': data.get('title', ''),
+            'channel': data.get('uploader') or data.get('channel', ''),
             'duration': int(data.get('duration') or 0),
-            'thumb':    thumb,
+            'thumb': data.get('thumbnail') or f'https://i.ytimg.com/vi/{video_id}/mqdefault.jpg',
         })
-    except yt_dlp.utils.DownloadError as e:
-        return jsonify({ 'error': str(e) }), 400
     except Exception as e:
-        return jsonify({ 'error': 'Internal error: ' + str(e) }), 500
+        return jsonify({'error': str(e)}), 400
 
-
-# ── Audio download + stream ───────────────────────────
 @app.route('/audio')
 def audio():
     video_id = request.args.get('id', '').strip()
     if not video_id:
-        return jsonify({ 'error': 'Missing id' }), 400
+        return jsonify({'error': 'Missing id'}), 400
 
-    # Use mkstemp for safety (mktemp is deprecated)
     fd, tmp_base = tempfile.mkstemp()
     os.close(fd)
-    os.unlink(tmp_base)  # yt-dlp will create its own file with extension
+    os.unlink(tmp_base)
 
-    ydl_opts = {
-        'format': 'bestaudio[ext=m4a]/bestaudio[acodec=aac]/bestaudio/best',
-        'outtmpl': tmp_base + '.%(ext)s',
-        'quiet': True,
-        'no_warnings': True,
-        'postprocessors': [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'm4a',
-            'preferredquality': '128',  # 128k is fine for mobile, smaller file
-        }],
-        # Prevent yt-dlp from downloading age-restricted content etc.
-        'age_limit': None,
-    }
+    # Try multiple format strategies
+    format_strategies = [
+        'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best',
+        'bestaudio/best',
+        '140/251/250/249/171/bestaudio/best',
+        'worst',
+    ]
 
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info_data = ydl.extract_info(
-                f'https://www.youtube.com/watch?v={video_id}',
-                download=True
-            )
+    info_data = None
+    actual = None
 
-        # Find the output file
-        actual = None
-        for ext in ('m4a', 'mp4', 'webm', 'opus', 'ogg', 'mp3'):
-            candidate = f'{tmp_base}.{ext}'
-            if os.path.exists(candidate):
-                actual = candidate
-                break
+    for fmt in format_strategies:
+        opts = {
+            **YDL_BASE,
+            'format': fmt,
+            'outtmpl': tmp_base + '.%(ext)s',
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'm4a',
+                'preferredquality': '128',
+            }],
+        }
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info_data = ydl.extract_info(
+                    f'https://www.youtube.com/watch?v={video_id}', download=True)
 
-        # Sometimes yt-dlp names it differently after postprocessing
-        if not actual:
-            base_dir = os.path.dirname(tmp_base)
-            base_name = os.path.basename(tmp_base)
-            for fname in os.listdir(base_dir):
-                if fname.startswith(base_name):
-                    actual = os.path.join(base_dir, fname)
+            # Find output file
+            for ext in ('m4a', 'mp3', 'mp4', 'webm', 'opus', 'ogg'):
+                c = f'{tmp_base}.{ext}'
+                if os.path.exists(c):
+                    actual = c
                     break
 
-        if not actual or not os.path.exists(actual):
-            return jsonify({ 'error': 'Audio file not found after processing' }), 500
+            if not actual:
+                base_dir = os.path.dirname(tmp_base)
+                base_name = os.path.basename(tmp_base)
+                for fname in sorted(os.listdir(base_dir)):
+                    if fname.startswith(base_name):
+                        actual = os.path.join(base_dir, fname)
+                        break
 
-        file_ext  = actual.rsplit('.', 1)[-1].lower()
-        mime_map  = {
-            'm4a':  'audio/mp4',
-            'mp3':  'audio/mpeg',
-            'opus': 'audio/ogg; codecs=opus',
-            'ogg':  'audio/ogg',
-            'webm': 'audio/webm',
-            'mp4':  'audio/mp4',
-        }
-        mime      = mime_map.get(file_ext, 'audio/mp4')
-        file_size = os.path.getsize(actual)
+            if actual and os.path.exists(actual):
+                break  # Success
 
-        title    = info_data.get('title') or video_id
-        channel  = info_data.get('uploader') or info_data.get('channel', '')
-        duration = int(info_data.get('duration') or 0)
-        thumb    = info_data.get('thumbnail') or f'https://i.ytimg.com/vi/{video_id}/mqdefault.jpg'
+        except Exception:
+            _cleanup(tmp_base)
+            continue
 
-        def safe_ascii(s):
-            """Encode header value safely for HTTP headers."""
-            return str(s).encode('ascii', errors='replace').decode('ascii')
+    if not actual or not os.path.exists(actual):
+        return jsonify({'error': 'No se pudo descargar el audio. El vídeo puede estar restringido.'}), 400
 
-        def stream_file():
-            try:
-                with open(actual, 'rb') as f:
-                    while True:
-                        chunk = f.read(65536)
-                        if not chunk:
-                            break
-                        yield chunk
-            finally:
-                try:
-                    os.remove(actual)
-                except OSError:
-                    pass
+    file_ext = actual.rsplit('.', 1)[-1].lower()
+    mime_map = {
+        'm4a': 'audio/mp4', 'mp3': 'audio/mpeg',
+        'opus': 'audio/ogg; codecs=opus', 'ogg': 'audio/ogg',
+        'webm': 'audio/webm', 'mp4': 'audio/mp4',
+    }
+    mime = mime_map.get(file_ext, 'audio/mp4')
+    file_size = os.path.getsize(actual)
 
-        headers = {
-            'Content-Length':                str(file_size),
-            'Content-Type':                  mime,
-            'Content-Disposition':           'inline',
-            'Access-Control-Allow-Origin':   '*',
+    def safe_ascii(s):
+        return str(s or '').encode('ascii', errors='replace').decode('ascii')
+
+    title    = info_data.get('title', '') if info_data else video_id
+    channel  = (info_data.get('uploader') or info_data.get('channel', '')) if info_data else ''
+    duration = int(info_data.get('duration') or 0) if info_data else 0
+    thumb    = (info_data.get('thumbnail') or f'https://i.ytimg.com/vi/{video_id}/mqdefault.jpg') if info_data else ''
+
+    def stream_file():
+        try:
+            with open(actual, 'rb') as f:
+                while True:
+                    chunk = f.read(65536)
+                    if not chunk:
+                        break
+                    yield chunk
+        finally:
+            try: os.remove(actual)
+            except OSError: pass
+
+    return Response(
+        stream_with_context(stream_file()),
+        status=200,
+        mimetype=mime,
+        direct_passthrough=True,
+        headers={
+            'Content-Length': str(file_size),
+            'Content-Type': mime,
+            'Content-Disposition': 'inline',
+            'Access-Control-Allow-Origin': '*',
             'Access-Control-Expose-Headers': 'X-Title,X-Channel,X-Duration,X-Thumb,X-Ext',
             'X-Title':    safe_ascii(title),
             'X-Channel':  safe_ascii(channel),
@@ -144,29 +163,15 @@ def audio():
             'X-Thumb':    safe_ascii(thumb),
             'X-Ext':      file_ext,
         }
+    )
 
-        return Response(
-            stream_with_context(stream_file()),
-            status=200,
-            headers=headers,
-            mimetype=mime,
-            direct_passthrough=True,
-        )
-
-    except yt_dlp.utils.DownloadError as e:
-        # Clean up temp files on error
-        for ext in ('m4a', 'mp4', 'webm', 'opus', 'ogg', 'mp3', ''):
-            try:
-                p = tmp_base + ('.' + ext if ext else ext)
-                if os.path.exists(p):
-                    os.remove(p)
-            except OSError:
-                pass
-        return jsonify({ 'error': str(e) }), 400
-
-    except Exception as e:
-        return jsonify({ 'error': 'Internal error: ' + str(e) }), 500
-
+def _cleanup(tmp_base):
+    for ext in ('m4a', 'mp3', 'mp4', 'webm', 'opus', 'ogg', ''):
+        try:
+            p = tmp_base + ('.' + ext if ext else '')
+            if os.path.exists(p): os.remove(p)
+        except OSError:
+            pass
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8000))
